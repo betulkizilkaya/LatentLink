@@ -1,6 +1,8 @@
 import numpy as np
 import sqlite3
 import re
+import jellyfish
+from rapidfuzz.distance import Levenshtein
 from sentence_transformers import SentenceTransformer
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input, Dense, Dropout
@@ -48,6 +50,18 @@ def l2n(m):
 Z = l2n(enc.predict(E))# Encoder'dan latent katmanı alınıyor
 S = cosine_similarity(Z)# Cosine benzerlik hesaplanıyor
 
+def levenshtein_similarity(s1, s2):
+    max_len = max(len(s1), len(s2)) # Maksimum uzunluk hesaplanıyor
+    if max_len == 0: # Eğer her iki metin de boş ise benzerlik 1.0 olarak kabul edilir
+        return 1.0
+    return 1 - Levenshtein.distance(s1, s2) / max_len # Levenshtein benzerliği hesaplanıyor
+
+def jaro_winkler_similarity(a: str, b: str) -> float:
+    return jellyfish.jaro_winkler_similarity(a, b)
+
+cos_weight = 0.85# Anlam ağırlığının oranını daha fazla verdim. Kur'anda anlam benzerliği daha önemli.
+lev_weight = 0.15
+
 conn = sqlite3.connect("results.db")
 c = conn.cursor()
 c.execute("""
@@ -55,8 +69,12 @@ CREATE TABLE IF NOT EXISTS search_results_yazir (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     query_text TEXT,
     result_text TEXT,
-    similarity REAL,
-    UNIQUE(query_text, result_text) # Tekrar eden kayıtları engellemek için UNIQUE kısıtlaması ekleniyor
+    cos_sim REAL, 
+    lev_sim REAL, 
+    jaro_sim REAL,
+    contributions TEXT,
+    final_sim REAL,
+    UNIQUE(query_text, result_text) 
 )
 """)
 
@@ -82,13 +100,24 @@ for i, t in enumerate(texts):
             continue
 
         tj_norm = normalize_text(texts[j])
-        sim_val = 1.0 if t_norm == tj_norm else float(sims[j])# Benzerlik değeri hesaplanır. Eğer metinler eşitse 1.0, değilse cosine benzerlik değeri kullanılır.
+
+        cos_val = 1.0 if t_norm == tj_norm else float(sims[j])# Cosine benzerlik değeri alınır. Eğer metinler eşitse 1.0, değilse cosine benzerlik değeri kullanılır.
+        lev_val = levenshtein_similarity(t_norm, tj_norm)# Levenshtein benzerliği hesaplanır
+        jaro_val = jaro_winkler_similarity(t_norm, tj_norm)  # Jaro-Winkler benzerliği hesaplanır
+
+        cos_contrib = 0.7 * cos_val
+        lev_contrib = 0.2 * lev_val
+        jaro_contrib = 0.1 * jaro_val
+
+        final_sim = cos_contrib + lev_contrib + jaro_contrib
+
+        contrib_str = f"cos:{cos_contrib:.3f}|lev:{lev_contrib:.3f}|jaro:{jaro_contrib:.3f}"
 
         # a-b ve b-a tekrarını engellemek için sıralı ekleme yaptık
         qt, rt = sorted([t, texts[j]])
         c.execute(
-            "INSERT OR IGNORE INTO search_results_yazir (query_text, result_text, similarity) VALUES (?, ?, ?)",
-            (qt, rt, sim_val)
+            "INSERT OR IGNORE INTO search_results_yazir (query_text, result_text, cos_sim, lev_sim, jaro_sim, contributions, final_sim) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (qt, rt, cos_val,lev_val,jaro_val,contrib_str,final_sim)
         )
 
     if i % 100 == 0:
